@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#030712">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Spatial Guard · Mid-air PIN entry with shoulder-surfing defense</title>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/htm@3.1.1/dist/htm.umd.js"></script>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}</script>
+<style>
+html,body,#root{margin:0;height:100%}
+body{background:radial-gradient(ellipse at 50% 25%,#0b1a33,#030712 70%);color:#cffafe;font-family:'JetBrains Mono',ui-monospace,monospace;overflow:hidden;overscroll-behavior:none}
+.disp{font-family:'Chakra Petch',sans-serif}
+.glass{background:rgba(3,10,25,.62);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border:1px solid rgba(34,211,238,.28);box-shadow:0 0 24px rgba(34,211,238,.08),inset 0 0 18px rgba(34,211,238,.05);border-radius:14px}
+.scan{background:repeating-linear-gradient(0deg,rgba(34,211,238,.035) 0 1px,transparent 1px 3px)}
+.hud{padding:max(.75rem,env(safe-area-inset-top)) max(.75rem,env(safe-area-inset-right)) max(.75rem,env(safe-area-inset-bottom)) max(.75rem,env(safe-area-inset-left))}
+.btn{pointer-events:auto;border:1px solid rgba(34,211,238,.5);border-radius:10px;padding:.6rem .9rem;font-size:.75rem;color:#67e8f9;background:rgba(8,47,73,.45);transition:background .15s,box-shadow .15s}
+.btn:hover:not(:disabled){background:rgba(8,145,178,.35);box-shadow:0 0 18px rgba(34,211,238,.35)}
+.btn:focus-visible{outline:2px solid #e879f9;outline-offset:2px}
+.btn:disabled{opacity:.45}
+.btn.amber{border-color:#fbbf24;color:#fcd34d;background:rgba(120,53,15,.5)}
+.alert{animation:glow 1.4s ease-in-out infinite alternate}
+@keyframes glow{from{box-shadow:0 0 30px rgba(251,191,36,.3)}to{box-shadow:0 0 80px rgba(251,191,36,.7)}}
+@media (prefers-reduced-motion:reduce){.alert{animation:none}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="module">
+import * as THREE from 'three';
+
+const { useState, useRef, useEffect, useCallback } = React;
+const html = htm.bind(React.createElement);
+const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+const HAND_MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+const FACE_MODEL = 'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite';
+// DEMO ONLY: SHA-256 of the demo PIN "2580". In production, verify against your backend, never in client code.
+const PIN_HASH = 'ed946f65d2c785d90e827c5ffd879ce3b49c68d4c88013074176a7e73bc58bcf';
+const DWELL = .45;                        // seconds a fingertip must stay on a key to register a press
+const S = { fps: 0, hands: 0, faces: 0, threat: false, inject: false, delegate: 'GPU' };   // telemetry engine -> React
+const add = THREE.AdditiveBlending;
+const sha = async s => [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)))].map(b => b.toString(16).padStart(2, '0')).join('');
+const LAYOUT = [['1', 0, 0], ['2', 1, 0], ['3', 2, 0], ['4', 0, 1], ['5', 1, 1], ['6', 2, 1], ['7', 0, 2], ['8', 1, 2], ['9', 2, 2], ['0', 1, 3], ['Clear', 2, 3]];
+const cl = (v, a, b) => a > b ? (a + b) / 2 : Math.max(a, Math.min(b, v));
+
+/* ---------- Three.js stage: holographic keypad, fingertip cursor, threat guard ---------- */
+function createStage(el, cb, log) {
+  const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2)); renderer.setClearColor(0x000000, 0);
+  const dom = renderer.domElement; dom.style.touchAction = 'none'; el.appendChild(dom);
+  const scene = new THREE.Scene(), hud = new THREE.Group(); scene.add(hud);
+  const ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, -2000, 2000);   // 1 unit = 1 CSS px, so overlay aligns with the video
+  const E = { locked: false, authed: false };
+  const fb = { x: 0, y: 0, w: 0, on: false };                               // smoothed primary-face box (world px)
+  let W = 1, H = 1, mode = 'idle', video, hands, faces, lastT = -1, frames = 0, fpsT = 0, last = 0, streak = 0, ptr = null, flash = 0, hov = { id: null, t: 0, fired: false };
+
+  const rs = () => {
+    W = el.clientWidth || 1; H = el.clientHeight || 1; renderer.setSize(W, H);
+    Object.assign(ortho, { left: -W / 2, right: W / 2, top: H / 2, bottom: -H / 2 }); ortho.updateProjectionMatrix();
+  };
+  new ResizeObserver(rs).observe(el); rs();
+
+  const glow = (() => {
+    const c = document.createElement('canvas'); c.width = c.height = 64;
+    const x = c.getContext('2d'), g = x.createRadialGradient(32, 32, 0, 32, 32, 32);
+    g.addColorStop(0, '#fff'); g.addColorStop(.25, 'rgba(255,255,255,.7)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+    x.fillStyle = g; x.fillRect(0, 0, 64, 64); return new THREE.CanvasTexture(c);
+  })();
+  const mk = (n, mat, Cls) => { const g = new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(new Float32Array(n * 3), 3)); const o = new Cls(g, mat); o.frustumCulled = false; return o; };
+  const pm = (c, s) => new THREE.PointsMaterial({ color: c, size: s, map: glow, transparent: true, blending: add, depthWrite: false, sizeAttenuation: false });
+  const put = (o, arr) => { const a = o.geometry.attributes.position; arr.forEach((v, i) => v.toArray(a.array, i * 3)); a.needsUpdate = true; };
+
+  /* fingertip rig: landmark array, skeleton, index-tip cursor */
+  const p = Array.from({ length: 21 }, () => new THREE.Vector3());
+  const rig = { g: new THREE.Group(), conn: null, sk: null, pts: mk(21, pm(0x22d3ee, 14), THREE.Points), cur: mk(1, pm(0xe879f9, 40), THREE.Points) };
+  rig.g.add(rig.pts, rig.cur); rig.g.visible = false; hud.add(rig.g);
+
+  /* holographic keypad: each key = glass face (hit target) + glow/dwell layer + depth backplate */
+  const label = (txt) => {
+    const c = document.createElement('canvas'); c.width = c.height = 128; const x = c.getContext('2d');
+    x.fillStyle = 'rgba(4,16,36,.8)'; x.strokeStyle = '#22d3ee'; x.lineWidth = 5; x.beginPath(); x.roundRect(6, 6, 116, 116, 22); x.fill(); x.stroke();
+    x.fillStyle = '#cffafe'; x.shadowColor = '#22d3ee'; x.shadowBlur = 14; x.textAlign = 'center'; x.textBaseline = 'middle';
+    x.font = `700 ${txt.length > 1 ? 32 : 64}px "Chakra Petch",sans-serif`; x.fillText(txt, 64, 68); return new THREE.CanvasTexture(c);
+  };
+  const pad = new THREE.Group(); hud.add(pad);
+  const keys = LAYOUT.map(([id, c, r]) => {
+    const g = new THREE.Group(); g.position.set((c - 1) * 1.1, (1.5 - r) * 1.1, 0);
+    const face = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ map: label(id), transparent: true })); face.userData.id = id;
+    const fx = new THREE.Mesh(new THREE.PlaneGeometry(1.08, 1.08), new THREE.MeshBasicMaterial({ color: 0x22d3ee, transparent: true, opacity: 0, blending: add, depthWrite: false })); fx.position.z = .03;
+    const back = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ color: 0x0e7490, transparent: true, opacity: .35, blending: add, depthWrite: false })); back.position.z = -.2;
+    g.add(back, face, fx); pad.add(g); return { id, g, face, fx };
+  });
+  document.fonts.load('700 64px "Chakra Petch"').then(() => keys.forEach(k => { k.face.material.map = label(k.id); k.face.material.needsUpdate = true; }));
+
+  const ray = new THREE.Raycaster(), DOWN = new THREE.Vector3(0, 0, -1), faceMeshes = keys.map(k => k.face);
+  const pick = (x, y) => { ray.set(new THREE.Vector3(x, y, 1000), DOWN); const h = ray.intersectObjects(faceMeshes)[0]; return h ? h.object.userData.id : null; };
+  const setPtr = (e) => { const r = dom.getBoundingClientRect(); ptr = [e.clientX - r.left - W / 2, H / 2 - (e.clientY - r.top)]; };
+  dom.addEventListener('pointermove', setPtr);
+  dom.addEventListener('pointerdown', (e) => {   // pointer mode: tap a key
+    setPtr(e); if (mode !== 'sim' || !pad.visible) return;
+    scene.updateMatrixWorld(); const id = pick(ptr[0], ptr[1]); if (id) { flash = performance.now(); cb.key(id); }
+  });
+
+  /* threat guard: >1 hand or >1 face for 3 consecutive frames triggers lockdown */
+  const judge = (nh, nf) => {
+    S.hands = nh; S.faces = nf;
+    const why = nh > 1 ? 'Second hand detected in frame' : nf > 1 ? 'Unauthorized face detected behind user' : S.inject ? 'Simulated intruder injected' : null;
+    S.threat = !!why; streak = why ? streak + 1 : 0;
+    if (why && streak >= 3 && !E.locked) { E.locked = true; hov = { id: null, t: 0, fired: false }; cb.threat(true, why); }
+  };
+
+  const frame = (hr, fr) => {
+    const vw = video.videoWidth, vh = video.videoHeight, s = Math.max(W / vw, H / vh), dw = vw * s, dh = vh * s, ox = (W - dw) / 2, oy = (H - dh) / 2;
+    const wx = nx => ox + (1 - nx) * dw - W / 2, wy = ny => H / 2 - oy - ny * dh;   // mirrored like the selfie video
+    const dets = fr ? fr.detections : [];
+    judge(hr.landmarks.length, dets.length);
+    const d = dets.slice().sort((a, b) => b.boundingBox.width - a.boundingBox.width)[0];
+    if (d) {
+      const b = d.boundingBox, t = { x: wx((b.originX + b.width / 2) / vw), y: wy((b.originY + b.height / 2) / vh), w: b.width / vw * dw };
+      if (fb.on) { fb.x += (t.x - fb.x) * .2; fb.y += (t.y - fb.y) * .2; fb.w += (t.w - fb.w) * .2; } else Object.assign(fb, t);
+      fb.on = true;
+    } else fb.on = false;
+    const L = hr.landmarks[0];
+    if (!L || E.locked) { rig.g.visible = false; return; }
+    const fresh = !rig.g.visible; rig.g.visible = true;
+    L.forEach((l, i) => { const t = new THREE.Vector3(wx(l.x), wy(l.y), -l.z * dw); fresh ? p[i].copy(t) : p[i].lerp(t, .65); });
+    put(rig.pts, p); put(rig.sk, rig.conn.flatMap(c => [p[c.start], p[c.end]])); put(rig.cur, [p[8]]);
+  };
+
+  renderer.setAnimationLoop(() => {
+    const now = performance.now(), dt = Math.min((now - last) / 1000, .05); last = now; frames++;
+    if (now - fpsT > 500) { S.fps = Math.round(frames * 1000 / (now - fpsT)); frames = 0; fpsT = now; }
+    if (mode === 'idle') return;
+    if (mode === 'live' && video.readyState >= 2 && video.currentTime !== lastT) {
+      lastT = video.currentTime;
+      try { frame(hands.detectForVideo(video, now), faces ? faces.detectForVideo(video, now) : null); } catch (e) { /* skip frame */ }
+    }
+    if (mode === 'sim') { judge(0, 0); rig.g.visible = false; }
+
+    /* keypad pose: floats beside the detected face, tilted toward it */
+    const k = Math.min(W * .2, H * .13, 92), pw = 3.3 * k, ph = 4.4 * k, live = mode === 'live', side = fb.on && fb.x > 0 ? -1 : 1;
+    const tx = cl(live ? (fb.on ? fb.x + side * (fb.w / 2 + pw / 2 + k * .4) : W / 2 - pw / 2 - 16) : 0, -W / 2 + pw / 2 + 8, W / 2 - pw / 2 - 8);
+    const ty = cl(live && fb.on ? fb.y : 0, -H / 2 + ph / 2 + (W < 768 ? 170 : 16), H / 2 - ph / 2 - 96);
+    pad.position.x += (tx - pad.position.x) * .15; pad.position.y += (ty - pad.position.y) * .15; pad.scale.setScalar(k);
+    pad.rotation.y += ((live ? -side * .28 : 0) - pad.rotation.y) * .1; pad.rotation.x = .08 * Math.sin(now / 1400);
+    pad.visible = !E.locked && !E.authed;
+
+    /* fingertip -> key intersection with dwell-to-press */
+    scene.updateMatrixWorld();
+    const tip = live && rig.g.visible ? p[8] : !live && ptr ? { x: ptr[0], y: ptr[1] } : null;
+    const id = pad.visible && tip ? pick(tip.x, tip.y) : null;
+    if (id !== hov.id) hov = { id, t: 0, fired: false };
+    else if (id && live) { hov.t += dt; if (!hov.fired && hov.t >= DWELL) { hov.fired = true; cb.key(id); } }
+    keys.forEach(kk => {
+      const on = kk.id === hov.id, pr = !on ? 0 : live ? Math.min(hov.t / DWELL, 1) : 1, hit = on && (hov.fired || now - flash < 220);
+      kk.fx.material.opacity = on ? .2 + .5 * pr : 0; kk.fx.scale.setScalar(.6 + .4 * pr); kk.fx.material.color.setHex(hit ? 0x34d399 : 0x22d3ee); kk.g.position.z = on ? .12 : 0;
+    });
+    renderer.render(scene, ortho);
+  });
+
+  return {
+    E,
+    async live(v) {
+      video = v; mode = 'idle';
+      if (!v.srcObject) {
+        log('Requesting camera stream…');
+        v.srcObject = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+        await v.play(); log('Camera online · ' + v.videoWidth + '×' + v.videoHeight);
+      }
+      if (!hands) {
+        log('Loading MediaPipe vision runtime…');
+        const { FilesetResolver, HandLandmarker, FaceDetector } = await import(MP + '/vision_bundle.mjs');
+        const fs = await FilesetResolver.forVisionTasks(MP + '/wasm');
+        const load = async (C, path, extra) => {
+          for (const d of ['GPU', 'CPU']) { try { return [await C.createFromOptions(fs, { baseOptions: { modelAssetPath: path, delegate: d }, runningMode: 'VIDEO', ...extra }), d]; } catch (e) { /* try next delegate */ } }
+          throw new Error('model load failed');
+        };
+        const h = await load(HandLandmarker, HAND_MODEL, { numHands: 2 }); hands = h[0]; S.delegate = h[1];
+        log('HandLandmarker ready · ' + S.delegate + ' delegate');
+        try { faces = (await load(FaceDetector, FACE_MODEL, { minDetectionConfidence: .6 }))[0]; log('FaceDetector ready · multi-person guard armed'); }
+        catch (e) { log('FaceDetector unavailable · hand-count guard only', 2); }
+        rig.conn = HandLandmarker.HAND_CONNECTIONS; rig.sk = mk(rig.conn.length * 2, new THREE.LineBasicMaterial({ color: 0x38bdf8, transparent: true, opacity: .7, blending: add, depthWrite: false }), THREE.LineSegments); rig.g.add(rig.sk);
+      }
+      lastT = -1; mode = 'live';
+    },
+    sim() { if (video && video.srcObject) { video.srcObject.getTracks().forEach(t => t.stop()); video.srcObject = null; } S.hands = S.faces = 0; mode = 'sim'; },
+    resume() { E.locked = false; streak = 0; S.inject = false; },
+    inject(on) { S.inject = on; }
+  };
+}
+
+/* ---------- React dashboard ---------- */
+function App() {
+  const [mode, setMode] = useState('boot'), [logs, setLogs] = useState([]), [st, setSt] = useState(S), [busy, setBusy] = useState(false);
+  const [len, setLen] = useState(0), [auth, setAuth] = useState(false), [msg, setMsg] = useState(''), [threat, setThreat] = useState({ on: false, why: '' }), [dx, setDx] = useState(innerWidth >= 768);
+  const mount = useRef(), vid = useRef(), eng = useRef(), pin = useRef(''), vb = useRef(false), fails = useRef(0), keyFn = useRef();
+  const log = useCallback((m, k) => setLogs(l => [{ id: performance.now() + Math.random(), t: new Date().toLocaleTimeString('en-GB'), m, k }, ...l].slice(0, 50)), []);
+  useEffect(() => { log('On-device spatial guard initialised · awaiting operator'); const t = setInterval(() => setSt({ ...S }), 400); return () => clearInterval(t); }, []);
+
+  keyFn.current = async (id) => {   // digits live only in a ref and are never logged or rendered
+    if (vb.current) return;
+    if (id === 'Clear') { pin.current = ''; setLen(0); setMsg(''); log('Spatial Matrix Registered: Input Buffer Cleared'); return; }
+    if (pin.current.length >= 4) return;
+    pin.current += id; setLen(pin.current.length); log('Spatial Matrix Registered: Digit Input Captured');
+    if (pin.current.length < 4) return;
+    vb.current = true; const ok = (await sha(pin.current)) === PIN_HASH; pin.current = '';
+    let wait = 700;
+    if (ok) { fails.current = 0; setMsg(''); eng.current.E.authed = true; setAuth(true); log('Authentication verified · session unlocked', 1); }
+    else {
+      fails.current++; setMsg('Access denied · attempt ' + fails.current + ' of 3'); log('Authentication rejected · input buffer wiped', 2);
+      if (fails.current >= 3) { fails.current = 0; wait = 10000; setMsg('Too many attempts · keypad paused for 10 s'); }
+    }
+    setTimeout(() => { vb.current = false; setLen(0); }, wait);
+  };
+  const onThreat = (on, why) => {
+    setThreat({ on, why }); pin.current = ''; vb.current = false; setLen(0); setMsg('');
+    eng.current.E.authed = false; setAuth(false); log('Shoulder-surfing threat intercepted · ' + why, 2);
+  };
+
+  const go = async (cam) => {
+    setBusy(true);
+    if (!eng.current) {
+      try { eng.current = createStage(mount.current, { key: id => keyFn.current(id), threat: onThreat }, log); log('WebGL context created · hardware renderer online'); }
+      catch (e) { log('WebGL initialisation failed', 2); setMode('nogl'); setBusy(false); return; }
+    }
+    if (cam) {
+      try { await eng.current.live(vid.current); setMode('live'); log('Spatial guard armed · hand + face tracking live', 1); }
+      catch (e) { log('Camera guard unavailable (' + (e.name || 'error') + ') · pointer mode engaged', 2); eng.current.sim(); setMode('sim'); }
+    } else { eng.current.sim(); setMode('sim'); log('Pointer mode engaged · tap keys to enter PIN'); }
+    setBusy(false);
+  };
+  const resume = () => { eng.current.resume(); setThreat({ on: false, why: '' }); setIntr(false); log('Threat cleared · authentication resumed', 1); };
+  const [intr, setIntr] = useState(false);
+  const lock = () => { eng.current.E.authed = false; setAuth(false); log('Session locked by operator'); };
+
+  const live = mode === 'live', sim = mode === 'sim', smooth = st.fps >= 55;
+  const status = threat.on ? 'Input suspended' : auth ? 'Access granted' : msg || (sim ? 'Tap a key to enter your PIN' : 'Point at a key and hold to enter your PIN');
+  const rows = [
+    ['Engine Status: ⚡ On-Device Spatial Guard Active', true],
+    [live ? (st.delegate === 'CPU' ? 'Vector Inference Layer: CPU Fallback' : 'Vector Inference Layer: WebGL Accelerated') : 'Vector Inference Layer: WebGL Render · Camera Offline', live ? st.delegate !== 'CPU' : sim],
+    [`Refresh Index: ${st.fps} FPS ${smooth ? 'Smooth' : 'Adaptive'}`, smooth],
+    [`Scene: ${st.faces} face${st.faces === 1 ? '' : 's'} · ${st.hands} hand${st.hands === 1 ? '' : 's'}`, !st.threat],
+    [`Session: ${auth ? 'Unlocked' : threat.on ? 'Suspended' : 'Locked'}`, auth],
+  ];
+
+  return html`
+  <div class="relative h-full w-full overflow-hidden">
+    <video ref=${vid} muted=${true} playsInline=${true} autoPlay=${true} style=${{ transform: 'scaleX(-1)' }}
+      class=${'absolute inset-0 h-full w-full object-cover transition-opacity duration-700 ' + (live ? 'opacity-100' : 'opacity-0')}></video>
+    <div ref=${mount} class="absolute inset-0 z-10"></div>
+    <div class="scan pointer-events-none absolute inset-0 z-20"></div>
+    ${threat.on && html`<div class="absolute inset-0 z-[25] bg-amber-950/40 backdrop-blur-3xl"></div>`}
+
+    <div class="hud pointer-events-none absolute inset-0 z-30 flex flex-col justify-between md:flex-row">
+      <div class="glass hidden px-4 py-3 md:block md:self-start">
+        <div class="disp text-xl font-bold tracking-wide text-cyan-300">Spatial Guard</div>
+        <div class="text-[11px] text-cyan-100/60">Mid-air PIN entry with shoulder-surfing defense</div>
+      </div>
+      <div class="mt-auto flex min-h-0 flex-col gap-2 md:mt-0 md:h-full md:w-80">
+        ${(live || sim) && html`<div class="flex gap-2">
+          <button class="btn flex-1" onClick=${() => { eng.current.inject(!intr); setIntr(!intr); }}>${intr ? 'Clear intruder' : 'Simulate intruder'}</button>
+          <button class="btn flex-1" disabled=${busy} onClick=${() => go(!live)}>${live ? 'Pointer mode' : 'Retry camera'}</button>
+        </div>`}
+        <div class="glass p-3 text-[11px] leading-5">
+          <button class="pointer-events-auto flex w-full items-center justify-between text-left" onClick=${() => setDx(!dx)}><span class="text-cyan-300">Diagnostics</span><span>${st.fps} FPS ${dx ? '▾' : '▸'}</span></button>
+          ${dx && rows.map(([t, ok], i) => html`<div key=${i} class="flex items-start"><span class=${'mr-2 mt-[7px] h-1.5 w-1.5 shrink-0 rounded-full ' + (ok ? 'bg-emerald-400 shadow-[0_0_8px_#34d399]' : 'bg-amber-400')}></span><span>${t}</span></div>`)}
+        </div>
+        <div class="glass h-24 min-h-0 p-3 text-[11px] md:h-auto md:flex-1">
+          <div class="mb-1 text-cyan-300/70">Event log</div>
+          <div class="h-[calc(100%-1.25rem)] space-y-0.5 overflow-y-auto">
+            ${logs.map(l => html`<div key=${l.id} class=${l.k === 2 ? 'text-amber-300' : l.k ? 'text-emerald-300' : 'text-cyan-100/75'}><span class="text-slate-500">${l.t}</span> ${l.m}</div>`)}
+          </div>
+        </div>
+      </div>
+    </div>
+
+    ${(live || sim) && html`<div class="pointer-events-none absolute left-1/2 z-30 -translate-x-1/2" style=${{ top: 'max(.75rem,env(safe-area-inset-top))' }}>
+      <div class=${'glass px-4 py-2 text-center ' + (threat.on ? 'opacity-40' : '')}>
+        <div class="flex justify-center gap-2" aria-label="PIN entry, digits hidden">
+          ${[0, 1, 2, 3].map(i => html`<span key=${i} class=${'grid h-10 w-9 place-items-center rounded-lg border text-2xl ' + (i < len ? 'border-cyan-300 text-cyan-200 shadow-[0_0_12px_#22d3ee]' : 'border-cyan-500/30 text-cyan-500/40')}>${i < len ? '✱' : '·'}</span>`)}
+        </div>
+        <div class=${'mt-1 text-[11px] ' + (auth ? 'text-emerald-300' : msg || threat.on ? 'text-amber-300' : 'text-cyan-100/70')}>${status}</div>
+      </div>
+    </div>`}
+
+    ${auth && !threat.on && html`<div class="absolute inset-0 z-30 grid place-items-center p-4 pointer-events-none">
+      <div class="glass w-full max-w-xs border-emerald-400/50 p-5 text-center">
+        <div class="disp text-xl font-bold text-emerald-300">Session unlocked</div>
+        <p class="mt-1 text-xs text-cyan-100/70">The keypad is hidden while you're signed in.</p>
+        <button class="btn mt-4 w-full" onClick=${lock}>Lock session</button>
+      </div></div>`}
+
+    ${threat.on && html`<div class="pointer-events-none absolute inset-0 z-40 grid place-items-center p-4">
+      <div role="alert" class="alert pointer-events-auto w-full max-w-lg rounded-2xl border border-amber-400 bg-black/60 p-6 text-center">
+        <p class="disp text-lg font-bold leading-snug text-amber-300">⚠️ CRITICAL ALERT: Shoulder-Surfing Threat Intercepted. Authentication canvas suspended to maintain session integrity.</p>
+        <p class="mt-3 text-xs text-amber-100/70">${threat.why}. The camera feed is blurred and all input is blocked.</p>
+        <button class="btn amber mt-5" disabled=${st.threat} onClick=${resume}>${st.threat ? 'Threat still in frame…' : 'Resume authentication'}</button>
+      </div></div>`}
+
+    ${mode === 'nogl' && html`<div class="absolute inset-0 z-40 grid place-items-center p-4"><div class="glass max-w-sm p-5 text-sm text-amber-300">WebGL isn't available on this device, so the holographic keypad can't start. Try a current version of Chrome, Edge, or Safari with hardware acceleration on.</div></div>`}
+
+    ${mode === 'boot' && html`
+      <div class="absolute inset-0 z-50 grid place-items-center bg-black/45 p-4 backdrop-blur-sm">
+        <div class="glass w-full max-w-md p-6">
+          <h1 class="disp text-3xl font-bold tracking-wide text-cyan-300">Spatial Guard</h1>
+          <p class="mt-3 text-xs leading-relaxed text-cyan-100/70">Enter a PIN on a floating 3D keypad by holding your index fingertip over each key. If a second hand or another face enters the frame, the camera feed blurs and input locks. Video is processed on this device and never uploaded.</p>
+          <p class="mt-3 text-xs text-cyan-100/70">Demo PIN: <span class="text-cyan-300">2580</span></p>
+          <div class="mt-5 flex flex-col gap-2">
+            <button class="btn" disabled=${busy} onClick=${() => go(true)}>${busy ? 'Calibrating…' : '⚡ Start spatial guard'}</button>
+            <button class="btn" disabled=${busy} onClick=${() => go(false)}>Use pointer mode (no camera)</button>
+          </div>
+        </div>
+      </div>`}
+  </div>`;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
+</script>
+</body>
+</html>
